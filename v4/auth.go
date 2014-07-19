@@ -1,4 +1,4 @@
-package awsauth
+package v4
 
 import (
 	"crypto/hmac"
@@ -10,6 +10,17 @@ import (
 	"log"
 	"time"
 )
+
+// authorizationHeaderComponents contains the fields needed to build an
+// authorization header
+type authorizationHeaderComponents struct {
+	algorithm     string
+	accessKey     string
+	date          string
+	region        string
+	signedHeaders string
+	signature     string
+}
 
 func GetHeaders(file files.File, settings settings.CommandSettings) map[string]string {
 
@@ -60,14 +71,17 @@ func GetHeaders(file files.File, settings settings.CommandSettings) map[string]s
 	// Compute the signature
 	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
 
+	c := authorizationHeaderComponents{
+		algorithm:     "AWS4-HMAC-SHA256",
+		accessKey:     settings.AccessKeyID,
+		date:          time.Now().UTC().Format("20060102"),
+		region:        settings.Region,
+		signedHeaders: "host;x-amz-content-sha256;x-amz-date",
+		signature:     signature,
+	}
+
 	// Make the header
-	header := makeHeader(
-		"AWS4-HMAC-SHA256",
-		settings.AccessKeyID,
-		time.Now().UTC().Format("20060102"),
-		settings.Region,
-		"host;x-amz-content-sha256;x-amz-date",
-		signature)
+	header := buildAuthorizationHeaderValue(c)
 
 	retMap := map[string]string{
 		"Authorization":        header,
@@ -79,20 +93,19 @@ func GetHeaders(file files.File, settings settings.CommandSettings) map[string]s
 	return retMap
 }
 
+// hmacSHA256 calculates the hmacSHA256 from a key (slice of bytes) and a
+// message string. It returns a slice of bytes.
 func hmacSHA256(key []byte, content string) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(content))
 	return mac.Sum(nil)
 }
 
-func makeHeader(
-	algo,
-	accessKey,
-	date,
-	region,
-	signedHeaders,
-	signature string) string {
-	return algo + " Credential=" + accessKey + "/" + date + "/" +
-		region + "/s3/aws4_request" +
-		",SignedHeaders=" + signedHeaders + ",Signature=" + signature
+// buildAuthorizationHeaderValue creates the string which will be used as the
+// authorization header in the request to AWS.
+// See: http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-auth-using-authorization-header.html
+func buildAuthorizationHeaderValue(c authorizationHeaderComponents) string {
+	return c.algorithm + " Credential=" + c.accessKey + "/" + c.date + "/" +
+		c.region + "/s3/aws4_request" +
+		",SignedHeaders=" + c.signedHeaders + ",Signature=" + c.signature
 }
