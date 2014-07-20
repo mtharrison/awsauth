@@ -4,93 +4,115 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"github.com/mtharrison/s3p/files"
-	"github.com/mtharrison/s3p/settings"
-	"io/ioutil"
-	"log"
 	"time"
 )
 
-// authorizationHeaderComponents contains the fields needed to build an
-// authorization header
-type authorizationHeaderComponents struct {
-	algorithm     string
-	accessKey     string
-	date          string
-	region        string
-	signedHeaders string
-	signature     string
+const (
+	ALGORITHM      string = "AWS4-HMAC-SHA256"
+	SIGNED_HEADERS string = "host;x-amz-content-sha256;x-amz-date"
+)
+
+// RequestOptions hold the options set by the user of this package
+type RequestOptions struct {
+	payload         []byte
+	destinationPath string
+	bucketName      string
+	region          string
+	secretAccessKey string
+	accessKeyID     string
 }
 
-func GetHeaders(file files.File, settings settings.CommandSettings) map[string]string {
+// signedRequest hold the values of the various pieces data that are created
+// and required to arrive at the final authorization headers
+type signedRequest struct {
+	signedPayload    string
+	date             string
+	shortDate        string
+	canonicalRequest string
+	signature        string
+	stringToSign     string
+}
+
+func GetHeaders(options RequestOptions) map[string]string {
 
 	// 3 stage process from http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
 
 	// Task 1: Create a Canonical Request
-
-	bagbytes, err := ioutil.ReadFile(file.Path)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	hash := sha256.Sum256(bagbytes)
-
-	signedPayload := hex.EncodeToString(hash[:])
-
-	xdate := time.Now().UTC().Format("20060102T150405Z")
-
-	canonicalRequest := "PUT\n" +
-		"/" + settings.DestinationPath + file.Path + "\n" +
-		"\n" +
-		"host:" + settings.BucketName + ".s3.amazonaws.com\n" +
-		"x-amz-content-sha256:" + signedPayload + "\n" +
-		"x-amz-date:" + xdate + "\n" +
-		"\n" +
-		"host;x-amz-content-sha256;x-amz-date\n" +
-		signedPayload
-
-	hashedCanonicalRequest := sha256.Sum256([]byte(canonicalRequest))
-	hashedCanonicalRequestString := hex.EncodeToString(hashedCanonicalRequest[:])
+	signedReq := signedRequest{}
+	signedReq.signedPayload = sha256hex(options.payload)
+	signedReq.date = getAmazonDate()
+	signedReq.shortDate = getAmazonShortDate()
+	signedReq.canonicalRequest = getCanonicalRequest(options, signedReq)
 
 	// Task 2: Create a String to Sign
-
-	stringToSign := "AWS4-HMAC-SHA256\n" +
-		xdate + "\n" +
-		time.Now().Format("20060102") + "/" + settings.Region + "/s3/aws4_request" + "\n" +
-		hashedCanonicalRequestString
+	signedReq.stringToSign = getStringToSign(options, signedReq)
 
 	// Task 3: Calculate Signature
+	signedReq.signature = getSignature(options, signedReq)
 
-	//Make the signing key
-	step1 := hmacSHA256([]byte("AWS4"+settings.SecretAccessKey), time.Now().UTC().Format("20060102"))
-	step2 := hmacSHA256(step1, settings.Region)
+	// Build the auth header
+	authHeader := getAuthorizationHeader(options, signedReq)
+
+	// Prepare map of headers
+	headers := map[string]string{
+		"Authorization":        authHeader,
+		"Host":                 options.bucketName + ".s3.amazonaws.com",
+		"x-amz-content-sha256": signedReq.signedPayload,
+		"x-amz-date":           signedReq.date,
+	}
+
+	return headers
+}
+
+// getAuthorizationHeader creates the string which will be used as the
+// authorization header in the request to AWS
+func getAuthorizationHeader(options RequestOptions, signedReq signedRequest) string {
+	return ALGORITHM + " Credential=" + options.accessKeyID + "/" +
+		signedReq.date + "/" + options.region + "/s3/aws4_request" +
+		",SignedHeaders=" + SIGNED_HEADERS + ",Signature=" + signedReq.signature
+}
+
+func getSignature(options RequestOptions, signedReq signedRequest) string {
+	step1 := hmacSHA256([]byte("AWS4"+options.secretAccessKey), signedReq.shortDate)
+	step2 := hmacSHA256(step1, options.region)
 	step3 := hmacSHA256(step2, "s3")
 	signingKey := hmacSHA256(step3, "aws4_request")
 
-	// Compute the signature
-	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
+	return hex.EncodeToString(hmacSHA256(signingKey, signedReq.stringToSign))
+}
 
-	c := authorizationHeaderComponents{
-		algorithm:     "AWS4-HMAC-SHA256",
-		accessKey:     settings.AccessKeyID,
-		date:          time.Now().UTC().Format("20060102"),
-		region:        settings.Region,
-		signedHeaders: "host;x-amz-content-sha256;x-amz-date",
-		signature:     signature,
-	}
+func getCanonicalRequest(options RequestOptions, signedReq signedRequest) string {
+	requestString := "PUT\n" + "/" + options.destinationPath + "\n\n" +
+		"host:" + options.bucketName + ".s3.amazonaws.com\n" +
+		"x-amz-content-sha256:" + signedReq.signedPayload + "\n" +
+		"x-amz-date:" + signedReq.date + "\n\n" +
+		"host;x-amz-content-sha256;x-amz-date\n" + signedReq.signedPayload
 
-	// Make the header
-	header := buildAuthorizationHeaderValue(c)
+	return sha256hex([]byte(requestString))
+}
 
-	retMap := map[string]string{
-		"Authorization":        header,
-		"Host":                 settings.BucketName + ".s3.amazonaws.com",
-		"x-amz-content-sha256": signedPayload,
-		"x-amz-date":           xdate,
-	}
+func getStringToSign(options RequestOptions, signedReq signedRequest) string {
+	return "AWS4-HMAC-SHA256\n" + signedReq.date + "\n" +
+		signedReq.shortDate + "/" + options.region + "/s3/aws4_request" + "\n" +
+		signedReq.canonicalRequest
+}
 
-	return retMap
+// getAmazonDate returns the current date in the format required by amazon
+// 20060102T150405Z
+func getAmazonDate() string {
+	return time.Now().UTC().Format("20060102T150405Z")
+}
+
+// getAmazonShortDate returns the current date in the format required by amazon
+// 20060102
+func getAmazonShortDate() string {
+	return time.Now().Format("20060102")
+}
+
+// sha256hex converts the data into a hex encoded sha256 hash
+func sha256hex(data []byte) string {
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
 }
 
 // hmacSHA256 calculates the hmacSHA256 from a key (slice of bytes) and a
@@ -99,13 +121,4 @@ func hmacSHA256(key []byte, content string) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(content))
 	return mac.Sum(nil)
-}
-
-// buildAuthorizationHeaderValue creates the string which will be used as the
-// authorization header in the request to AWS.
-// See: http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-auth-using-authorization-header.html
-func buildAuthorizationHeaderValue(c authorizationHeaderComponents) string {
-	return c.algorithm + " Credential=" + c.accessKey + "/" + c.date + "/" +
-		c.region + "/s3/aws4_request" +
-		",SignedHeaders=" + c.signedHeaders + ",Signature=" + c.signature
 }
