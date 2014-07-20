@@ -33,6 +33,8 @@ type signedRequest struct {
 	stringToSign     string
 }
 
+// GetHeaders returns a map of headers, to then be used as part of a request to
+// aws
 func GetHeaders(options RequestOptions) map[string]string {
 
 	// 3 stage process from http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
